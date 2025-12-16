@@ -4,7 +4,7 @@ Analysis for the project: Epigenetic plasticity is a driver of heritable polluti
 The repository contains the analysis code associated with the manuscript "Epigenetic plasticity is a driver of heritable pollution tolerance in Fundulus heteroclitus".
 
 ## Scope
-The code provided illustrates the approach used in this study to evaluate how environmental PAH influences DNA methylation, SNP/SNV, RNA-seq, and cis-nat
+The code provided illustrates the approach used to evaluate how environmental PAH influences DNA methylation, SNP/SNV, RNA-seq, and cis-nat
 expression in PAH-sensitive and PAH-tolerant Fundulus heteroclitus. Full bioinformatic pipelines (read processing, alignment and genome assembly) are not included. 
 
 ## Data availability
