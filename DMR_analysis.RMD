@@ -1,0 +1,633 @@
+---
+title: "Fundulus Differential DNA Methylation Analysis"
+author: "Mathia Colwell"
+output: html_document
+---
+This document outlines our bioinformatics pipeline to call differential DNA Methylation from .BAM files generated from our long-read Oxford Nanopore Technology sequencing data and downstream analysis.
+
+
+##### Call Modified bases
+
+CpG methylation and hydroxymethyaltion global frequencies were estimated using Modkit v0.5.1. Modkits pileup command was run on the sorted BAM files to generate a per-site CpG summary.
+
+```{bash}
+modkit pileup \
+  -- ref kings_creek_genome_25.fa \
+  --cpg \
+  KC21Clean.mapped.sorted.bam \
+  KC21Clean.all.mods.bed
+```
+
+The resulting BED files contain the total number of calls and counts of the canonical cytosine, 5-methylcytosine (5mC) and 5-hydroxymethylcytosine (5hmC). For detailed column specs, refer to Modkit GitHub.
+
+```{bash}
+for bed in *.bed; do
+    awk -v file="$bed" '
+        $4 == "m" {
+            can  += $13;   # canonical (unmodified C)
+            mod  += $12;   # methylated (5mC)
+            oth  += $14;   # hydroxymethylated (5hmC or other)
+            valid+= $10;   # total observations
+        }
+        END {
+            printf "%s\tCpG canonical %.6f\tCpG methyl %.6f\tCpG hydroxy %.6f\n",
+                file, (can/valid), (mod/valid), (oth/valid)
+        }
+    ' "$bed"
+done >> methylation-summary.txt
+```
+
+Next, we filtered the modkit output to contain only methylated CpGs
+
+```{bash}
+# 5-methylcytosine
+awk '$4=="m"' KCClean.all.mods.bed > KCClean.m.bed
+
+# 5-hydroxymethylatosine
+awk '$4=="h"' KCClean.all.mods.bed > KCClean.h.bed
+```
+
+#### Call DMRs using a 25% Cutoff
+
+```{r}
+# Load Libraries
+library(methylKit)
+library(GenomicRanges)
+library(ggplot2)
+library(tidyr)
+library(genomation)
+library(readr)
+library(rtracklayer)
+
+# Load files 
+file.list <- list(
+"KC21ERSE.m.bed",
+"KC21Clean.m.bed",
+"RP21ERSE.m.bed",
+"RP21Clean.m.bed"
+)
+
+# Set Modkit Column Names
+modkit_cols <- list(
+fraction = FALSE,
+chr.col = 1,
+start.col = 2,
+end.col = 3,
+coverage.col = 5,
+strand.col = 6,
+freqC.col = 11
+)
+
+# Read the files with no minimum coverage
+myobj_lowCov <- methRead(file.list,
+                         sample.id = list("PAH-sensitive_+PAH", 
+                                          "PAH-sensitive_control", 
+                                          "PAH-tolerant_+PAH", 
+                                          "PAH-tolerant_control"),
+                         assembly = "fundulus",
+                         treatment = c(1, 0, 1, 0),
+                         context = "CpG",
+                         pipeline = modkit_cols
+)
+
+# Use 1000 bp tiled windows 
+tiles <- tileMethylCounts(
+  myobj_lowCov,
+  win.size  = 1000,
+  step.size = 1000,
+  cov.bases = 10
+)
+
+# Run on all comparisons we are interested in 
+process_comparison <- function(tiles, sample1, sample2) {
+
+  # Subset methylation tiles for pairwise comparison
+  tiles_subset <- reorganize(
+    tiles,
+    sample.ids = c(sample1, sample2),
+    treatment  = c(1, 0)
+  )
+
+  # Unite tiles into methylBase object
+  meth.tiles <- methylKit::unite(tiles_subset)
+
+  # Differential methylation
+  myDiff <- calculateDiffMeth(meth.tiles)
+
+  # Filter: ≥ 25% difference, q ≤ 0.01
+  dmr <- getMethylDiff(myDiff, difference = 25, qvalue = 0.01)
+
+  # Save DMR table
+  out_file <- file.path(
+    "/path",
+    paste0(sample1, "vs", sample2, "_DMRs.txt")
+  )
+  write.table(dmr, file = out_file, sep = "\t",
+              row.names = FALSE, quote = FALSE)
+
+  list(dmrs = dmr)
+}
+
+comparisons <- list(
+  c("PAH-sensitive_+PAH", "PAH-sensitive_control"),
+  c("PAH-tolerant_control", "PAH-sensitive_control"),
+  c("PAH-tolerant_+PAH", "PAH-sensitive_+PAH"),
+  c("PAH-tolerant_+PAH", "PAH-tolerant_control")
+)
+
+esults <- lapply(comparisons, function(pair) {
+
+  result <- process_comparison(tiles, pair[1], pair[2])
+
+  cat("\n----", pair[1], "vs", pair[2], "----\n")
+  cat("Total DMRs:", nrow(result$dmrs), "\n")
+  cat("Hypermethylated:", sum(result$dmrs$meth.diff > 0), "\n")
+  cat("Hypomethylated:", sum(result$dmrs$meth.diff < 0), "\n")
+  cat("Mean |delta methylation|:",
+      mean(abs(result$dmrs$meth.diff)), "\n")
+
+  return(result)
+})
+
+names(results) <- sapply(comparisons, paste, collapse = "vs")
+```
+
+Create an upset plot of the comparisons
+
+```{r}
+library(UpSetR)
+library(dplyr)
+
+# Read DMR data for each comparison
+read_dmr_data <- function(filename) {
+  read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+}
+
+dmr_files <- list(
+  "/PAH-tolerant_+PAHvsPAH-sensitive_+PAH_DMRs.txt",
+   "/PAH-tolerant_controlvsPAH-sensitive_control_DMRs.txt",
+   "/PAH-tolerant_+PAHvsPAH-tolerant_control_DMRs.txt", 
+  "/PAH-sensitive_+PAHvsPAH-sensitive_control_DMRs.txt"
+)
+
+dmr_data <- lapply(dmr_files, read_dmr_data)
+
+# Create a list of DMR locations for each comparison
+dmr_locations <- lapply(dmr_data, function(x) paste(x$chr, x$start, x$end, sep = "_"))
+
+# Create new name list for UpSetR
+names(dmr_locations) <- c(
+  "PAH tolerant +PAH vs. PAH-sensitive +PAH",
+  "PAH-tolerant control vs. PAH-sensitive control",
+  "PAH-tolerant +PAH vs. PAH-tolerant control",
+  "PAH-sensitive +PAH vs. PAH-sensitive control"
+)
+
+# Desired order
+set_order <- c(
+  "PAH tolerant +PAH vs. PAH-sensitive +PAH",
+  "PAH-tolerant control vs. PAH-sensitive control",
+  "PAH-tolerant +PAH vs. PAH-tolerant control",
+  "PAH-sensitive +PAH vs. PAH-sensitive control"
+)
+
+# Create the UpSet plot
+upset(fromList(dmr_locations), 
+      nsets = 4, 
+      order.by = "freq",
+      sets = set_order,  
+      keep.order = TRUE,
+      main.bar.color = "#0000FF", 
+      sets.bar.color = "#FF0000",
+      matrix.color = "#008000",
+      text.scale = c(1.2, 0.8, 0.8, 0.8, 1.2, 1),
+      point.size = 2,
+      line.size = 0.5,
+      mainbar.y.label = "DMR Intersections",
+      sets.x.label = "DMRs per Comparison",
+      mb.ratio = c(0.55, 0.45))
+# Save the plot
+ggsave("/DMR_UpSet_plot.svg",
+       width = 8,
+       height = 9)
+```
+
+Add gene names to the DMRs, then identify closest genes and distance away from closest gene. This pipeline is specific to the Kings Creek GTF, not the 4.1 Missouri Reference Genome.
+
+```{r}
+library(rtracklayer)
+library(GenomicRanges)
+library(dplyr)
+library(readr)
+
+# Specific to our GTF created. 
+process_liftoff_annotations <- function(gtf_path) {
+  # Import GTF file
+  gtf <- import(gtf_path, format = "gtf")
+  
+  # Extract only transcript features 
+  transcripts <- gtf[gtf$type == "transcript", ]
+  
+  # Create standardized gene annotations
+  gene_annotations <- data.frame(
+    chr = as.character(seqnames(transcripts)),
+    start = start(transcripts),
+    end = end(transcripts),
+    strand = as.character(strand(transcripts)),
+    gene_name = tolower(transcripts$gene_name),  
+    stringsAsFactors = FALSE
+  ) %>% 
+    distinct(gene_name, .keep_all = TRUE)
+  
+  # Convert to GRanges
+  GRanges(
+    seqnames = gene_annotations$chr,
+    ranges = IRanges(start = gene_annotations$start, 
+                    end = gene_annotations$end),
+    strand = gene_annotations$strand,
+    gene_name = gene_annotations$gene_name
+  )
+}
+
+# Annotate the DMRs with the gene name only 
+annotate_dmrs_with_genename <- function(dmr_file, gene_annotations) {
+  # Read DMR data
+  dmrs <- read_tsv(dmr_file, show_col_types = FALSE) %>%
+    mutate(chr = as.character(chr))
+  
+  # Convert to GRanges
+  dmr_gr <- makeGRangesFromDataFrame(dmrs, 
+                                   keep.extra.columns = TRUE,
+                                   seqnames.field = "chr",
+                                   start.field = "start",
+                                   end.field = "end")
+  
+  # Find overlapping genes
+  overlaps <- findOverlaps(dmr_gr, gene_annotations)
+  dmrs$gene_name <- NA_character_
+  dmrs$gene_name[queryHits(overlaps)] <- gene_annotations$gene_name[subjectHits(overlaps)]
+  
+  # For non-overlapping DMRs, find nearest gene
+  non_overlapping <- which(is.na(dmrs$gene_name))
+  if(length(non_overlapping) > 0) {
+    nearest <- distanceToNearest(dmr_gr[non_overlapping], gene_annotations)
+    dmrs$nearest_gene <- NA_character_
+    dmrs$distance_to_gene <- NA_integer_
+    dmrs$nearest_gene[non_overlapping] <- gene_annotations$gene_name[subjectHits(nearest)]
+    dmrs$distance_to_gene[non_overlapping] <- mcols(nearest)$distance
+  }
+  
+  # Fill nearest_gene with gene_name when gene_name exists but nearest_gene is NA
+  dmrs <- dmrs %>%
+    mutate(nearest_gene = ifelse(!is.na(gene_name) & is.na(nearest_gene), 
+                                gene_name, 
+                                nearest_gene),
+           distance_to_gene = ifelse(!is.na(gene_name) & is.na(distance_to_gene),
+                                   0,
+                                   distance_to_gene))
+  
+  # Select and order output columns
+  dmrs %>%
+    select(chr, start, end, strand, pvalue, qvalue, meth.diff,
+           gene_name, nearest_gene, distance_to_gene)
+}
+
+# Process annotations
+gene_annotations <- process_liftoff_annotations(
+  "/path/liftoff.gtf.gz"
+)
+
+# List of DMR files
+dmr_files <- c(
+  "PAH-sensitive_+PAHvsPAH-sensitive_control_DMRs.txt",
+  "PAH-tolerant_+PAHvsPAH-sensitive_+PAH_DMRs.txt",
+  "PAH-tolerant_controlvsPAH-sensitive_control_DMRs.txt",
+  "PAH-tolerant_+PAHvsPAH-tolerant_control_DMRs.txt"
+)
+
+# Process all DMR files
+for(file in dmr_files) {
+  annotated_dmrs <- annotate_dmrs_with_genename(file, gene_annotations)
+  
+  output_file <- gsub("_DMRs.txt", "_annotated_genename.tsv", file)
+  write_tsv(annotated_dmrs, output_file)
+  message("Saved ", output_file, " with ", 
+          sum(!is.na(annotated_dmrs$gene_name)), 
+          " direct gene overlaps")
+}
+```We were interested in detecting region specific methylation. The region input files were .bed files with the gene coordinates.
+
+```{bash}
+
+# Set the path to the  ROI file
+ROI_FILE="/path/gene_coordinates.tsv"
+
+# Create an array of .bed files
+BED_FILES=("/path/"/*.m.bed)
+
+# Create output file and write header
+OUTPUT_FILE="methylation_results.txt"
+echo -e "Gene\tChromosome\tStart\tEnd\t$(basename -a "${BED_FILES[@]}" | sed 's/\.m\.bed$/_Methylation/' | tr '\n' '\t')$(basename -a "${BED_FILES[@]}" | sed 's/\.m\.bed$/_CpG_Count/' | tr '\n' '\t' | sed 's/\t$//')" > "$OUTPUT_FILE"
+
+# Loop through each line in the ROI file
+while IFS=$'\t' read -r chr start end gene; do
+    echo "Processing region: $gene ($chr:$start-$end)"
+    results=("$gene" "$chr" "$start" "$end")
+
+    # Process each .bed file
+    for bed_file in "${BED_FILES[@]}"; do
+        echo "Analyzing $(basename "$bed_file")..."
+        result=$(awk -v chr="$chr" -v start="$start" -v end="$end" '
+            $1 == chr && $2 >= start && $3 <= end && $4 == "m" {
+                mod += $12
+                valid += $10
+                count++
+            }
+            END {
+                if (valid > 0) {
+                    printf "%.6f\t%d", mod/valid, count
+                } else {
+                    print "NA\t0"
+                }
+            }
+        ' "$bed_file")
+        results+=($result)
+    done
+
+    # Write results to output file
+    echo -e "$(IFS=$'\t'; echo "${results[*]}")" >> "$OUTPUT_FILE"
+done < "$ROI_FILE"
+
+echo "Analysis complete. Results are in $OUTPUT_FILE"
+```
+
+Below is the DMR methyaltion specific region
+
+```{bash}
+#!/bin/bash
+
+#Pull DMR methylation based off gene name
+
+RPCvKCC="/DMRs_PAH-tolerant_controlvsPAH-sensitive_control_annotated_genename.no.header.tsv"
+RPEvRPC="/DMRs_PAH-tolerant_+PAHvsPAH-tolerant_control_annotated_genename.no.header.tsv"
+RPEvKCE="/DMRs_PAH-tolerant_+PAHvsPAH-sensitive_+PAH_annotated_genename.no.header.tsv"
+KCEvKCC="/DMRs_PAH-sensitive_+PAHvsPAH-sensitive_control_annotated_genename.no.header.tsv"
+
+ROI="/path/ROI_coordinates.txt"
+
+mkdir -p vgk_intersects
+
+# Function to run intersection
+extract_dmrs () {
+    local file=$1
+    local label=$2
+
+    bedtools intersect \
+        -a "$ROI" \
+        -b "$file" \
+        -wa -wb > "vgk_intersects/${label}.raw.tsv"
+
+    # Extract useful columns:
+    awk -v L="$label" '
+        {
+          roi_chr=$1; roi_start=$2; roi_end=$3; gene=$4;
+          dmr_chr=$5; dmr_start=$6; dmr_end=$7;
+          meth=$11; nearest=$13;
+
+          print gene, roi_chr, roi_start, roi_end, dmr_chr, dmr_start, dmr_end, meth, nearest, L;
+        }
+    ' OFS="\t" "vgk_intersects/${label}.raw.tsv" \
+      > "vgk_intersects/${label}.clean.tsv"
+}
+
+extract_dmrs "$RPCvKCC" "RPCvKCC"
+extract_dmrs "$RPEvRPC" "RPEvRPC"
+extract_dmrs "$RPEvKCE" "RPEvKCE"
+extract_dmrs "$KCEvKCC" "KCEvKCC"
+
+echo "Intersections complete!"
+```
+
+#### Create Methylartist Graphs
+
+```{bash}
+#!/bin/bash
+
+# Set variables
+ROI_FILE="/region.txt"
+REF_GENOME="/Kings_creek_genome_25.fa"
+GTF_FILE="/liftoff3.gtf.gz"
+LOCUS_PLOT_DIR="/output_directory/"
+RESULTS_FILE="/Methylartist_loop_methylation_results.txt"
+
+
+# Create header for results file
+echo -e "Gene\tChromosome\tStart\tEnd\tAverage_Methylation_Sensitive\tAverage_Methylation_Tolerant" > "$RESULTS_FILE"
+
+# Process each region in the ROI file
+while IFS=$'\t' read -r chr start end gene; do
+    # Skip header or invalid lines
+    if [[ "$chr" == "chr" || -z "$chr" || -z "$start" || -z "$end" || -z "$gene" ]]; then
+        echo "$(date): Skipping invalid entry: $chr $start $end $gene"
+        continue
+    fi
+
+    # Adjust start and end positions to include 5000 bps flanks, this will help make the graph look nice
+    flanked_start=$((start - 5000))
+    flanked_end=$((end + 5000))
+
+    # Ensure flanked_start is not less than 1
+    if (( flanked_start < 1 )); then
+        flanked_start=1
+    fi
+
+    # Define the interval with flanks and the highlight region (actual ROI)
+    INTERVAL="${chr}:${flanked_start}-${flanked_end}"
+    HIGHLIGHT="${chr}:${start}-${end}"
+    echo "$(date): Processing region: $gene ($INTERVAL) with highlight: $HIGHLIGHT"
+
+    # Generate locus plot for Pair 1 (PAH-sensitive)
+    LOCUS_OUTPUT1="$LOCUS_PLOT_DIR/${gene}_sensitive_locus.svg"
+    echo "$(date): Generating locus plot for $gene (PAH-sensitive)..."
+    methylartist locus \
+        -b KC21ERSE_tiag.q10.bam,KC21Clean_tiag.q10.bam \
+        -i "$INTERVAL" \
+        -l "$HIGHLIGHT" \
+        --ref "$REF_GENOME" \
+        --gtf "$GTF_FILE" \
+        --motif CG \
+        --primary_only \
+        --labelgenes \
+        --hidelegend \
+        --mods m \
+        --svg \
+        -o "$LOCUS_OUTPUT1"
+
+    # Check if locus plot generation was successful; failure to generate plot is usually caused by a problem in the GTF
+    if [ ! -f "$LOCUS_OUTPUT1" ]; then
+        echo "$(date): Error: Failed to generate locus plot for $gene (PAH-sensitive)"
+        continue
+    fi
+
+    # Generate locus plot for Pair 2 (PAH-tolerant)
+    LOCUS_OUTPUT2="$LOCUS_PLOT_DIR/${gene}_tolerant_locus.svg"
+    echo "$(date): Generating locus plot for $gene (PAH-tolerant)..."
+    methylartist locus \
+        -b RP21ERSE_tiag.q10.bam:#d62728,RP21Clean_tia.q10.bam:#2ca02c \
+        -i "$INTERVAL" \
+        -l "$HIGHLIGHT" \
+        --ref "$REF_GENOME" \
+        --gtf "$GTF_FILE" \
+        --motif CG \
+        --labelgenes \
+        --hidelegend \
+        --primary_only \
+        --mods m \
+        --svg \
+        -o "$LOCUS_OUTPUT2"
+
+    # Check if locus plot generation was successful
+    if [ ! -f "$LOCUS_OUTPUT2" ]; then
+        echo "$(date): Error: Failed to generate locus plot for $gene (PAH-tolerant)"
+        continue
+    fi
+
+    # Calculate average methylation for the region
+    echo "Calculating average methylation for $gene..."
+    AVG_METH_SENSITIVE=$(methylartist segmeth \
+        -b KC21ERSE_tiag.q10.sorted.bam,KC21Clean_tiag.q10.sorted.bam \
+        -i "$INTERVAL" \
+        --ref "$REF_GENOME" \
+        --motif CG \
+        --primary_only \
+        --mods m \
+        --output /dev/stdout | \
+        awk 'NR>1 {sum+=$5; count++} END {print (count>0) ? sum/count : "NA"}')
+
+    AVG_METH_TOLERANT=$(methylartist segmeth \
+        -b RP21ERSE.modmapped.q10.sorted.bam,RP21Clean_tiag.q10.sorted.bam \
+        -i "$INTERVAL" \
+        --ref "$REF_GENOME" \
+        --motif CG \
+        --primary_only \
+        --mods m \
+        --output /dev/stdout | \
+        awk 'NR>1 {sum+=$5; count++} END {print (count>0) ? sum/count : "NA"}')
+
+    # Append results to the tab-delimited file
+    echo -e "$gene\t$chr\t$start\t$end\t$AVG_METH_SENSITIVE\t$AVG_METH_TOLERANT" >> "$RESULTS_FILE"
+
+    echo "Completed processing $gene"
+done < "$ROI_FILE"
+```
+
+Create a heatmap using region of interest DNA Methyaltion values
+
+```{r}
+# Read in methylation data
+methylation_data <- read_delim(
+  "/gene_methylation.txt",
+  delim = "\t",
+  col_names = TRUE
+)
+
+# Rename the columns (samples)
+colnames(methylation_data)[5:8] <- c(
+  "PAH-Sensitive Control",
+  "PAH-Sensitive PAH Exposed",
+  "PAH-Tolerant Control",
+  "PAH-Tolerant Exposed"
+)
+
+# Long format
+methylation_long <- methylation_data %>%
+  pivot_longer(
+    cols = 5:8,
+    names_to = "sample",
+    values_to = "methylation"
+  ) %>%
+  mutate(methylation = as.numeric(methylation))
+
+# Average by gene + sample
+methylation_aggregated <- methylation_long %>%
+  group_by(Gene, sample) %>%
+  summarize(mean_methylation = mean(methylation, na.rm = TRUE), .groups = "drop")
+
+# Wide matrix
+methylation_matrix <- methylation_aggregated %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = mean_methylation,
+    values_fill = list(mean_methylation = 0)
+  ) %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# Reorder samples
+sample_order <- c(
+  "PAH-Sensitive Control",
+  "PAH-Sensitive PAH Exposed",
+  "PAH-Tolerant Control",
+  "PAH-Tolerant Exposed"
+)
+methylation_matrix <- methylation_matrix[, sample_order]
+
+# Sort genes 
+gene_order <- order(
+  methylation_matrix[, "PAH-Sensitive Control"],
+  decreasing = TRUE
+)
+methylation_sorted <- methylation_matrix[gene_order, ]
+
+# Compute relative z-scores 
+control_mean <- mean(
+  methylation_sorted[, "PAH-Sensitive Control"],
+  na.rm = TRUE
+)
+control_sd <- sd(
+  methylation_sorted[, "PAH-Sensitive Control"],
+  na.rm = TRUE
+)
+
+relative_z <- (methylation_sorted - control_mean) / control_sd
+
+relative_z[relative_z >  3] <-  3
+relative_z[relative_z < -3] <- -3
+
+metab_wrapped_labels <- c(
+  "PAH-Sensitive\nControl",
+  "PAH-Sensitive\nPAH Exposed",
+  "PAH-Tolerant\nControl",
+  "PAH-Tolerant\nExposed"
+)
+
+heatmap_colors <- colorRampPalette(c("navy", "white", "firebrick3"))(256)
+heatmap_breaks <- seq(-3, 3, length.out = 257)
+
+heatmap <- pheatmap(
+  metab_relative_z,
+  scale = "none",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = metab_heatmap_colors,
+  breaks = metab_heatmap_breaks,
+  fontsize = 16,
+  fontsize_row = 8,
+  fontsize_col = 12,
+  angle_col = 0,
+  labels_col = metab_wrapped_labels,
+  family = "Arial",
+  main = "Gene Methylation",
+  na_col = "white",
+  border_color = "grey"
+)
+
+# Save as SVG
+save_pheatmap_svg(
+  heatmap,
+  "/methylation.heatmap.scaled.svg"
+)
+```
+                        
