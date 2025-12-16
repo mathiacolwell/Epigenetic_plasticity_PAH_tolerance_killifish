@@ -14,7 +14,7 @@ were calculated for downstream comparisons.
 library(tidyverse)
 ```
 
-# TPM matrix: rows = genes, columns = samples
+# Sample of TPM matrix: rows = genes, columns = samples
 
 ```{r}
 tpm_mat <- tibble(
