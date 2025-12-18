@@ -747,42 +747,41 @@ A cis-NAT is defined as:
 * gene_name = transcript_id
 The Parent transcripts are all remaining features.
 
-Check rownames(counts) contain the "gene|transcript" feature format. *BE CAREFUL about gene|transcript naming*. Always check the file to make sure you're calling the correct gene or transcript.
+# Filter for Novel Transcripts
 
-```{bash}
-# Extract gene name and transcript ID
-gene_names <- sub("\\|.*",  "", rownames(counts))
-transcript_ids <- sub(".*\\|", "", rownames(counts))
+```{r}
+# Load data
+abundance <- read.delim("/KCClean_output.tsv", header = TRUE, sep = "\t")
 
-# Logical rule for cis-NAT classification
-is_cisnat <- grepl("^STRG\\.", transcript_ids) &    
-             gene_names == transcript_ids
- 
-# Parent transcripts 
-is_parent <- !is_cisnat
+# Calculate transcript length
+abundance$Length <- abundance$End - abundance$Start + 1
 
-# Split count matrices
-cisnat_counts  <- counts[is_cisnat, ]
-parent_counts  <- counts[is_parent, ]
+# Print starting count
+cat("Total input transcripts:", nrow(abundance), "\n")
 
-# Log2-transform if desired
-log2_cisnat  <- log2(cisnat_counts + 1)
-log2_parent  <- log2(parent_counts + 1)
+# Filter length >= 200
+filtered_length <- subset(abundance, Length >= 200)
 
-# Quick sanity checks
-cat("Number of cis-NAT transcripts:",  nrow(cisnat_counts), "\n")
-cat("Number of parent transcripts:",  nrow(parent_counts), "\n")
+# Filter TPM >= 1
+filtered_tpm <- subset(filtered_length, TPM >= 1)
 
-head(rownames(cisnat_counts)) 
-head(rownames(parent_counts))
+# Filter Coverage >= 10
+filtered_data <- subset(filtered_tpm, Coverage >= 10)
+
+# Identify novel transcripts (Gene ID starts with "STRG.")
+novel_transcripts <- subset(filtered_data, grepl("^STRG\\.", Gene.ID))
+
+# Output summary
+cat("Transcripts after length >= 200 filter:", nrow(filtered_length), "\n")
+cat("Transcripts after TPM >= 1 filter:", nrow(filtered_tpm), "\n")
+cat("Transcripts after Coverage >= 10 filter:", nrow(filtered_data), "\n")
+cat("Remaining novel transcripts (STRG.):", nrow(novel_transcripts), "\n")
+
+# Save filtered tables
+write.table(filtered_data, file = "/filtered_abundance.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(novel_transcripts, file = "/novel_transcripts.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
 ```
-
-Custom DEG-calling used mean log2, mean TPM per condiiton, log2fold change threshold
-
-#####################################
-#####################################
-#####################################
-####################################
 
 #### Variant Calling
 
