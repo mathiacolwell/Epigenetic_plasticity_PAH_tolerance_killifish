@@ -6,8 +6,8 @@ The analysis evalute how environmental exposure to polycyclic hydrocarbons (PAHs
 
 ## Scope
 This repository includes downstream analysis used to generate main results in the manuscript. Analysis include: 
-- DNA methylation (long-read sequencing: global and locus-specific_
-- SNP/SNV
+- DNA methylation (long-read sequencing: global and locus-specific)
+- SNP/SNV calling
 - RNA-seq gene expression
 - cis-nat expression
 - Cross population comparisons between PAH-sensitive and PAH-tolerant killifish
@@ -16,10 +16,16 @@ This repository includes downstream analysis used to generate main results in th
 - Full bioinformatic pipelines for raw read processing and alignment
 - Genome assembly and polishing of Kings Creek Reference Genome
 
-*ref. our genome assembly repository:* https://github.com/mathiacolwell/Fundulus_Genome_Assembly
-
 ## Data availability
-Raw sequencing data are available through NCBI GEO and GenBank under accessions provided below and in our manuscript: 
+Raw sequencing data are available through NCBI GEO under accessions provided below: 
+
+**Long read sequencing data:** GSE313974
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE313974
+
+**RNA-seq data:** GSE313975
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE313975
 
 *Kings Creek 25 Reference Genome*
 - Submission: SUB15839686 
